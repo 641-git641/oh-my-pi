@@ -133,6 +133,37 @@ describe("libkitty end-to-end", () => {
 		}
 	});
 
+	it("cancels a drag when transcript rows change before release", async () => {
+		const copySpy = vi.spyOn(clipboard, "copyToClipboard").mockResolvedValue(undefined);
+		const target = "drag-cancel-target";
+		try {
+			await mode.init({ suppressWelcomeIntro: true });
+			void mode.getUserInput();
+			await term.waitForRender();
+			mode.addMessageToChat(assistantSelectionMessage(target));
+			mode.ui.requestRender(true);
+			await term.waitForRender(() => plainRows(term.getViewport()).some(row => row.includes(target)));
+
+			const viewport = plainRows(term.getViewport());
+			const screenRow = viewport.findIndex(row => row.includes(target));
+			expect(screenRow).toBeGreaterThanOrEqual(0);
+			const startColumn = viewport[screenRow]!.indexOf(target);
+			const endColumn = startColumn + target.length - 1;
+			term.sendInput(`\x1b[<0;${startColumn + 1};${screenRow + 1}M`);
+			term.sendInput(`\x1b[<32;${endColumn + 1};${screenRow + 1}M`);
+
+			mode.addMessageToChat(assistantSelectionMessage("changed-after-drag"));
+			mode.ui.requestRender(true);
+			await term.waitForRender();
+			term.sendInput(`\x1b[<0;${endColumn + 1};${screenRow + 1}m`);
+			await term.waitForRender();
+
+			expect(copySpy).not.toHaveBeenCalled();
+		} finally {
+			copySpy.mockRestore();
+		}
+	});
+
 	it("keeps the whole buffer clean across non-overflowing width resizes", async () => {
 		term.resize(140, 40);
 		await mode.init({ suppressWelcomeIntro: true });

@@ -53,6 +53,20 @@ function reflowRowsAtWidth(lines: readonly string[], width: number): string[] {
 	return reflowed;
 }
 
+function sameRows(previous: readonly string[], next: readonly string[]): boolean {
+	if (previous.length !== next.length) return false;
+	for (let index = 0; index < previous.length; index++) {
+		if (previous[index] !== next[index]) return false;
+	}
+	return true;
+}
+
+interface ViewportSelectionSnapshot {
+	readonly lines: readonly string[];
+	readonly columns: number;
+	readonly revision: number;
+}
+
 /** Live settings that affect the composer before and after session adoption. */
 export interface ComposerPreferences {
 	readonly quiet: boolean;
@@ -230,15 +244,20 @@ export class Composer implements TerminalFrameProvider {
 	#transferred = false;
 
 	#visibleViewportColumns = 0;
+	#visibleViewportRows = 0;
+	#visibleSelectionRevision = 0;
 	#visibleTranscriptStart = -1;
 	#visibleTranscriptRows: readonly string[] = [];
 	#visibleHistoryRows: readonly string[] = [];
+	#visibleHistoryHardRows: readonly string[] = [];
 	#visibleHistoryScreenOffset = 0;
 	#visibleHistoryWidth = 0;
 	#visibleHistoryBatchId: number | undefined;
+	#visibleHistoryBatchHardRows: readonly string[] = [];
 	#mouseSelectionUnsubscribe: (() => void) | undefined;
 	#selectionAnchor: ViewportSelectionPoint | undefined;
 	#selectionFocus: ViewportSelectionPoint | undefined;
+	#selectionSnapshot: ViewportSelectionSnapshot | undefined;
 	#copiedOverlayHandle: OverlayHandle | undefined;
 	#copiedOverlayTimer: NodeJS.Timeout | undefined;
 	constructor(options: ComposerOptions = {}) {
@@ -315,6 +334,19 @@ export class Composer implements TerminalFrameProvider {
 		});
 	}
 
+	#selectionLines(): readonly string[] {
+		return this.#visibleHistoryRows.length === 0
+			? this.#visibleTranscriptRows
+			: [...this.#visibleHistoryRows, ...this.#visibleTranscriptRows];
+	}
+
+	#cancelStaleSelection(): void {
+		if (this.#selectionSnapshot?.revision === this.#visibleSelectionRevision) return;
+		this.#selectionAnchor = undefined;
+		this.#selectionFocus = undefined;
+		this.#selectionSnapshot = undefined;
+	}
+
 	#transcriptPoint(row: number, col: number): ViewportSelectionPoint | undefined {
 		const screenRow = Math.trunc(row);
 		const column = Math.trunc(col);
@@ -346,22 +378,33 @@ export class Composer implements TerminalFrameProvider {
 		if (event.release) {
 			const anchor = this.#selectionAnchor;
 			const focus = point ?? this.#selectionFocus;
+			const snapshot = this.#selectionSnapshot;
 			this.#selectionAnchor = undefined;
 			this.#selectionFocus = undefined;
-			if (anchor === undefined || focus === undefined) {
+			this.#selectionSnapshot = undefined;
+			if (anchor === undefined || focus === undefined || snapshot === undefined) {
 				this.ui.requestRender();
 				return anchor !== undefined;
+			}
+			if (snapshot.revision !== this.#visibleSelectionRevision) {
+				this.ui.requestRender();
+				return true;
 			}
 			if (anchor.row === focus.row && anchor.col === focus.col) {
 				this.ui.requestRender();
 				return true;
 			}
-			void this.#copySelection(anchor, focus);
+			void this.#copySelection(anchor, focus, snapshot);
 			this.ui.requestRender();
 			return true;
 		}
 		if (event.motion) {
 			if (this.#selectionAnchor === undefined) return false;
+			if (this.#selectionSnapshot?.revision !== this.#visibleSelectionRevision) {
+				this.#cancelStaleSelection();
+				this.ui.requestRender();
+				return true;
+			}
 			if (point !== undefined) {
 				this.#selectionFocus = point;
 				this.ui.requestRender();
@@ -372,20 +415,26 @@ export class Composer implements TerminalFrameProvider {
 		if (point === undefined) {
 			this.#selectionAnchor = undefined;
 			this.#selectionFocus = undefined;
+			this.#selectionSnapshot = undefined;
 			return false;
 		}
 		this.#selectionAnchor = point;
 		this.#selectionFocus = point;
+		this.#selectionSnapshot = {
+			lines: [...this.#selectionLines()],
+			columns: this.#visibleViewportColumns,
+			revision: this.#visibleSelectionRevision,
+		};
 		this.ui.requestRender();
 		return true;
 	}
 
-	async #copySelection(anchor: ViewportSelectionPoint, focus: ViewportSelectionPoint): Promise<void> {
-		const lines =
-			this.#visibleHistoryRows.length === 0
-				? this.#visibleTranscriptRows
-				: [...this.#visibleHistoryRows, ...this.#visibleTranscriptRows];
-		const text = sliceViewportText(lines, this.#visibleViewportColumns, anchor, focus);
+	async #copySelection(
+		anchor: ViewportSelectionPoint,
+		focus: ViewportSelectionPoint,
+		snapshot: ViewportSelectionSnapshot,
+	): Promise<void> {
+		const text = sliceViewportText(snapshot.lines, snapshot.columns, anchor, focus);
 		try {
 			await copyToClipboard(text);
 			if (!this.#stopped && !this.#hasBlockingOverlay()) this.#showCopiedOverlay();
@@ -424,24 +473,47 @@ export class Composer implements TerminalFrameProvider {
 		this.#copiedOverlayHandle = undefined;
 		handle?.hide();
 	}
-	#recordVisibleViewport(columns: number, transcriptStart: number, transcriptRows: readonly string[]): void {
+	#recordVisibleViewport(
+		columns: number,
+		rows: number,
+		transcriptStart: number,
+		transcriptRows: readonly string[],
+	): void {
+		const nextRows = transcriptStart < 0 ? EMPTY_VIEWPORT_ROWS : transcriptRows;
+		const changed =
+			columns !== this.#visibleViewportColumns ||
+			rows !== this.#visibleViewportRows ||
+			transcriptStart !== this.#visibleTranscriptStart ||
+			!sameRows(this.#visibleTranscriptRows, nextRows);
+		if (changed) this.#visibleSelectionRevision++;
 		this.#visibleViewportColumns = columns;
+		this.#visibleViewportRows = rows;
 		this.#visibleTranscriptStart = transcriptStart;
-		this.#visibleTranscriptRows = transcriptStart < 0 ? EMPTY_VIEWPORT_ROWS : transcriptRows;
+		this.#visibleTranscriptRows = nextRows;
 	}
 
 	#clearVisibleHistory(): void {
+		if (
+			this.#visibleHistoryRows.length > 0 ||
+			this.#visibleHistoryHardRows.length > 0 ||
+			this.#visibleHistoryBatchId !== undefined
+		) {
+			this.#visibleSelectionRevision++;
+		}
 		this.#visibleHistoryRows = EMPTY_VIEWPORT_ROWS;
+		this.#visibleHistoryHardRows = EMPTY_VIEWPORT_ROWS;
 		this.#visibleHistoryScreenOffset = 0;
 		this.#visibleHistoryWidth = 0;
 		this.#visibleHistoryBatchId = undefined;
+		this.#visibleHistoryBatchHardRows = EMPTY_VIEWPORT_ROWS;
 	}
 
 	#refreshVisibleHistory(width: number): void {
 		if (this.#visibleHistoryRows.length === 0) return;
 		if (this.#visibleHistoryWidth !== width) {
-			this.#visibleHistoryRows = reflowRowsAtWidth(this.#visibleHistoryRows, width);
+			this.#visibleHistoryRows = reflowRowsAtWidth(this.#visibleHistoryHardRows, width);
 			this.#visibleHistoryScreenOffset = -this.#visibleHistoryRows.length;
+			this.#visibleSelectionRevision++;
 		}
 		this.#visibleHistoryWidth = width;
 	}
@@ -449,6 +521,7 @@ export class Composer implements TerminalFrameProvider {
 	#clearViewportSelection(): void {
 		this.#selectionAnchor = undefined;
 		this.#selectionFocus = undefined;
+		this.#selectionSnapshot = undefined;
 		this.#clearVisibleHistory();
 	}
 
@@ -461,12 +534,24 @@ export class Composer implements TerminalFrameProvider {
 		}
 		const transcriptStart = offered.source.header === "replay" ? (offered.source.headerRows?.length ?? 0) : 0;
 		const transcriptRows = history.rows.slice(transcriptStart);
-		if (history.kind === "replay" || this.#visibleHistoryBatchId === undefined) {
-			this.#visibleHistoryRows = transcriptRows;
-			this.#visibleHistoryScreenOffset = transcriptStart - history.rows.length;
-		} else if (history.id !== this.#visibleHistoryBatchId) {
-			this.#visibleHistoryRows = [...this.#visibleHistoryRows, ...transcriptRows];
-			this.#visibleHistoryScreenOffset -= history.rows.length;
+		const sameCurrentBatch =
+			history.id === this.#visibleHistoryBatchId && sameRows(this.#visibleHistoryBatchHardRows, transcriptRows);
+		if (!sameCurrentBatch) {
+			if (history.kind === "replay" || this.#visibleHistoryBatchId === undefined) {
+				this.#visibleHistoryHardRows = transcriptRows;
+			} else if (history.id !== this.#visibleHistoryBatchId) {
+				this.#visibleHistoryHardRows = [...this.#visibleHistoryHardRows, ...transcriptRows];
+			} else {
+				const priorRows = this.#visibleHistoryHardRows.slice(
+					0,
+					Math.max(0, this.#visibleHistoryHardRows.length - this.#visibleHistoryBatchHardRows.length),
+				);
+				this.#visibleHistoryHardRows = [...priorRows, ...transcriptRows];
+			}
+			this.#visibleHistoryRows = reflowRowsAtWidth(this.#visibleHistoryHardRows, width);
+			this.#visibleHistoryScreenOffset = -this.#visibleHistoryRows.length;
+			this.#visibleHistoryBatchHardRows = transcriptRows;
+			this.#visibleSelectionRevision++;
 		}
 		this.#visibleHistoryWidth = width;
 		this.#visibleHistoryBatchId = history.id;
@@ -479,7 +564,7 @@ export class Composer implements TerminalFrameProvider {
 		this.#refreshVisibleHistory(width);
 		if (!this.#started || this.#stopped) {
 			this.#clearVisibleHistory();
-			this.#recordVisibleViewport(width, -1, []);
+			this.#recordVisibleViewport(width, rows, -1, []);
 			return { viewport: [] };
 		}
 		if (this.#resizeRetiredHeaderStart !== undefined) {
@@ -495,7 +580,7 @@ export class Composer implements TerminalFrameProvider {
 			this.#clearVisibleHistory();
 			const composed = this.#renderRoots(roots, width);
 			const visible = rows > 0 && composed.length > rows ? composed.slice(-rows) : rows > 0 ? composed : [];
-			this.#recordVisibleViewport(width, -1, []);
+			this.#recordVisibleViewport(width, rows, -1, []);
 			return { viewport: visible };
 		}
 		const transcript = roots[transcriptIndex] as TranscriptContainer;
@@ -528,6 +613,8 @@ export class Composer implements TerminalFrameProvider {
 			transcriptStart = transcriptStartInComposed - composedStart;
 			transcriptRows = visible.slice(transcriptStart, transcriptEndInComposed - composedStart);
 		}
+		this.#recordVisibleViewport(width, rows, transcriptStart, transcriptRows);
+		this.#cancelStaleSelection();
 		let paintedVisible = visible;
 		const historyRows = this.#visibleHistoryRows;
 		const anchor = this.#selectionAnchor;
@@ -553,7 +640,6 @@ export class Composer implements TerminalFrameProvider {
 				}
 			}
 		}
-		this.#recordVisibleViewport(width, transcriptStart, transcriptRows);
 		return { history, viewport: paintedVisible };
 	}
 
