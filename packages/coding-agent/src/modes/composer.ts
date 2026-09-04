@@ -5,11 +5,15 @@ import {
 	isInsideTerminalMultiplexer,
 	ProcessTerminal,
 	type ResizeScrollbackMode,
-	Spacer,
+	routeSgrMouseInput,
+	type SgrMouseEvent,
 	sliceWithWidth,
+	Spacer,
+	type OverlayHandle,
 	type Terminal,
 	type TerminalFramePlan,
 	type TerminalFrameProvider,
+	Text,
 	truncateToWidth,
 	TUI,
 	type TUIOptions,
@@ -17,11 +21,18 @@ import {
 	visibleWidth,
 } from "@oh-my-pi/pi-tui";
 import { CustomEditor } from "./components/custom-editor";
+import {
+	highlightViewportSelection,
+	sliceViewportSelection as sliceViewportText,
+	type ViewportSelectionPoint,
+} from "./components/viewport-selection";
 import { type AnimationFrame, TranscriptContainer } from "./components/transcript-container";
 import { type LspServerInfo, type RecentSession, WelcomeComponent } from "./components/welcome";
 import { getEditorTheme, initThemeSync, theme } from "./theme/theme";
+import { copyToClipboard } from "../utils/clipboard";
 
 const DOUBLE_INTERRUPT_MS = 500;
+const EMPTY_VIEWPORT_ROWS: readonly string[] = [];
 
 /** Live settings that affect the composer before and after session adoption. */
 export interface ComposerPreferences {
@@ -199,6 +210,14 @@ export class Composer implements TerminalFrameProvider {
 	#stopped = false;
 	#transferred = false;
 
+	#visibleViewportColumns = 0;
+	#visibleTranscriptStart = -1;
+	#visibleTranscriptRows: readonly string[] = [];
+	#mouseSelectionUnsubscribe: (() => void) | undefined;
+	#selectionAnchor: ViewportSelectionPoint | undefined;
+	#selectionFocus: ViewportSelectionPoint | undefined;
+	#copiedOverlayHandle: OverlayHandle | undefined;
+	#copiedOverlayTimer: NodeJS.Timeout | undefined;
 	constructor(options: ComposerOptions = {}) {
 		if (typeof theme === "undefined") initThemeSync();
 		this.#exit = options.exit ?? (code => process.exit(code));
@@ -247,11 +266,134 @@ export class Composer implements TerminalFrameProvider {
 		this.ui.addChild(this.#statusHost);
 		this.ui.setFocus(this.editor);
 	}
+	/**
+	 * Enable transcript selection for the coding-agent interactive CLI. This is
+	 * intentionally separate from Composer construction so standalone Composer
+	 * users and other TUI hosts retain native terminal selection by default.
+	 */
+	enableTranscriptMouseSelection(): void {
+		if (this.#mouseSelectionUnsubscribe !== undefined) return;
+		this.ui.setMouseTracking(true);
+		this.#mouseSelectionUnsubscribe = this.ui.addInputListener(data => {
+			const hasBlockingOverlay = this.ui.overlayStack.some(entry => {
+				if (entry.hidden || entry.options?.focus === false) return false;
+				const visible = entry.options?.visible;
+				return visible === undefined || visible(this.ui.terminal.columns, this.ui.terminal.rows);
+			});
+			if (hasBlockingOverlay || !data.startsWith("\x1b[<")) return undefined;
+			return routeSgrMouseInput(data, event => this.#handleMouse(event)) ? { consume: true } : undefined;
+		});
+	}
+
+	#transcriptPoint(row: number, col: number): ViewportSelectionPoint | undefined {
+		const providerRow = Math.trunc(row) - this.ui.getProviderViewportTop();
+		const transcriptStart = this.#visibleTranscriptStart;
+		const transcriptEnd = transcriptStart + this.#visibleTranscriptRows.length;
+		if (transcriptStart < 0 || providerRow < transcriptStart || providerRow >= transcriptEnd) return undefined;
+		if (this.#visibleViewportColumns <= 0 || col < 0 || col >= this.#visibleViewportColumns) return undefined;
+		return {
+			row: providerRow - transcriptStart,
+			col: Math.min(this.#visibleViewportColumns - 1, Math.trunc(col)),
+		};
+	}
+	#handleMouse(event: SgrMouseEvent): boolean {
+		if (!this.#started || this.#stopped) return false;
+		if (event.wheel !== null) {
+			return this.#transcriptPoint(event.row, event.col) !== undefined;
+		}
+
+		const point = this.#transcriptPoint(event.row, event.col);
+		if (event.release) {
+			const anchor = this.#selectionAnchor;
+			const focus = point ?? this.#selectionFocus;
+			this.#selectionAnchor = undefined;
+			this.#selectionFocus = undefined;
+			if (anchor === undefined || point === undefined || focus === undefined) {
+				this.ui.requestRender();
+				return anchor !== undefined;
+			}
+			if (anchor.row === focus.row && anchor.col === focus.col) {
+				this.ui.requestRender();
+				return true;
+			}
+			void this.#copySelection(anchor, focus);
+			this.ui.requestRender();
+			return true;
+		}
+		if (event.motion) {
+			if (this.#selectionAnchor === undefined) return false;
+			if (point !== undefined) {
+				this.#selectionFocus = point;
+				this.ui.requestRender();
+			}
+			return true;
+		}
+		if (!event.leftClick) return false;
+		if (point === undefined) {
+			this.#selectionAnchor = undefined;
+			this.#selectionFocus = undefined;
+			return false;
+		}
+		this.#selectionAnchor = point;
+		this.#selectionFocus = point;
+		this.ui.requestRender();
+		return true;
+	}
+
+	async #copySelection(anchor: ViewportSelectionPoint, focus: ViewportSelectionPoint): Promise<void> {
+		const text = sliceViewportText(this.#visibleTranscriptRows, this.#visibleViewportColumns, anchor, focus);
+		try {
+			await copyToClipboard(text);
+			if (!this.#stopped) this.#showCopiedOverlay();
+		} catch {
+			// Clipboard implementations are best-effort; they normally swallow
+			// failures themselves, and a failed copy must not disrupt the CLI.
+		}
+	}
+
+	#showCopiedOverlay(): void {
+		this.#hideCopiedOverlay();
+		const text = theme.bold(theme.fg("accent", "Copied"));
+		const handle = this.ui.showOverlay(new Text(text, 0, 0), {
+			anchor: "bottom-right",
+			width: visibleWidth(text),
+			margin: { right: 1, bottom: 1 },
+			focus: false,
+		});
+		this.#copiedOverlayHandle = handle;
+		const timer = setTimeout(() => {
+			if (this.#copiedOverlayHandle !== handle) return;
+			this.#copiedOverlayHandle = undefined;
+			this.#copiedOverlayTimer = undefined;
+			handle.hide();
+		}, 1200);
+		timer.unref?.();
+		this.#copiedOverlayTimer = timer;
+	}
+
+	#hideCopiedOverlay(): void {
+		if (this.#copiedOverlayTimer !== undefined) {
+			clearTimeout(this.#copiedOverlayTimer);
+			this.#copiedOverlayTimer = undefined;
+		}
+		const handle = this.#copiedOverlayHandle;
+		this.#copiedOverlayHandle = undefined;
+		handle?.hide();
+	}
+	#recordVisibleViewport(columns: number, transcriptStart: number, transcriptRows: readonly string[]): void {
+		this.#visibleViewportColumns = columns;
+		this.#visibleTranscriptStart = transcriptStart;
+		this.#visibleTranscriptRows = transcriptStart < 0 ? EMPTY_VIEWPORT_ROWS : transcriptRows;
+	}
+
 	/** Compose the bounded mutable viewport and the next ordered history append. */
 	renderFrame(viewport: ViewportSize): TerminalFramePlan {
-		if (!this.#started || this.#stopped) return { viewport: [] };
 		const width = Math.max(1, viewport.columns);
 		const rows = Math.max(0, viewport.rows);
+		if (!this.#started || this.#stopped) {
+			this.#recordVisibleViewport(width, -1, []);
+			return { viewport: [] };
+		}
 		if (this.#resizeRetiredHeaderStart !== undefined) {
 			this.#retiredHeaderStart = this.#resizeRetiredHeaderStart;
 			this.#resizeRetiredHeaderStart = undefined;
@@ -262,7 +404,10 @@ export class Composer implements TerminalFrameProvider {
 			: [this.#header, this.#bootstrapInputGap, this.editor, this.#statusHost];
 		const transcriptIndex = roots.findIndex(root => root instanceof TranscriptContainer);
 		if (transcriptIndex < 0) {
-			return { viewport: this.#renderRoots(roots, width).slice(-rows) };
+			const composed = this.#renderRoots(roots, width);
+			const visible = rows > 0 && composed.length > rows ? composed.slice(-rows) : rows > 0 ? composed : [];
+			this.#recordVisibleViewport(width, -1, []);
+			return { viewport: visible };
 		}
 		const transcript = roots[transcriptIndex] as TranscriptContainer;
 		const preRoots = this.#renderRoots(roots.slice(0, transcriptIndex), width);
@@ -283,10 +428,32 @@ export class Composer implements TerminalFrameProvider {
 			const visibleHeaderRows = Math.max(0, rows - composed.length);
 			this.#retiredHeaderStart = Math.max(0, history.rows.length - visibleHeaderRows);
 		}
-		return {
-			history,
-			viewport: composed.length <= rows ? composed : composed.slice(-rows),
-		};
+		const visible = rows > 0 && composed.length > rows ? composed.slice(-rows) : rows > 0 ? composed : [];
+		const composedStart = composed.length - visible.length;
+		const transcriptStartInComposed = Math.max(composedStart, before.length);
+		const transcriptEndInComposed = Math.min(composed.length, before.length + active.length);
+		let transcriptStart = -1;
+		let transcriptRows: readonly string[] = [];
+		if (transcriptStartInComposed < transcriptEndInComposed) {
+			transcriptStart = transcriptStartInComposed - composedStart;
+			transcriptRows = visible.slice(transcriptStart, transcriptEndInComposed - composedStart);
+		}
+		let paintedVisible = visible;
+		if (this.#selectionAnchor !== undefined && this.#selectionFocus !== undefined && transcriptStart >= 0) {
+			const highlightedRows = highlightViewportSelection(
+				transcriptRows,
+				width,
+				this.#selectionAnchor,
+				this.#selectionFocus,
+			);
+			paintedVisible = [...visible];
+			for (let index = 0; index < highlightedRows.length; index++) {
+				const highlighted = highlightedRows[index];
+				if (highlighted !== undefined) paintedVisible[transcriptStart + index] = highlighted;
+			}
+		}
+		this.#recordVisibleViewport(width, transcriptStart, transcriptRows);
+		return { history, viewport: paintedVisible };
 	}
 
 	/** Acknowledges one accepted header, replay, or transcript batch. */
@@ -676,6 +843,7 @@ export class Composer implements TerminalFrameProvider {
 	stop(): void {
 		if (!this.#started || this.#stopped || this.#transferred) return;
 		this.#welcome?.stopIntro();
+		this.#hideCopiedOverlay();
 		this.ui.stop();
 		this.#stopped = true;
 	}
@@ -723,6 +891,7 @@ export class Composer implements TerminalFrameProvider {
 		// Remains live after transfer until InteractiveMode installs its configured handlers.
 		if (this.#stopped) return;
 		this.#welcome?.stopIntro();
+		this.#hideCopiedOverlay();
 		if (this.#started) this.ui.stop();
 		this.#stopped = true;
 		this.#exit(code);
