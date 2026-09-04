@@ -81,11 +81,16 @@ const PAINT_END = `${ENABLE_AUTOWRAP}${SYNC_OUTPUT_END}`;
 const PAINT_BEGIN_NO_SYNC = `${HIDE_CURSOR}${DISABLE_AUTOWRAP}`;
 const PAINT_END_NO_SYNC = ENABLE_AUTOWRAP;
 // Mouse reporting is disabled by default. Hosts may explicitly opt the normal
-// buffer in, while fullscreen overlays can independently enable it for their
-// own pointer interaction. SGR 1006 provides extended coordinates beyond the
-// legacy 223-column limit.
+// buffer in (using button-motion mode 1002), while fullscreen overlays can
+// independently enable any-motion mode 1003. SGR 1006 provides extended
+// coordinates beyond the legacy 223-column limit.
 const MOUSE_TRACKING_ON = "\x1b[?1000h\x1b[?1003h\x1b[?1006h";
 const MOUSE_TRACKING_OFF = "\x1b[?1006l\x1b[?1003l\x1b[?1000l";
+
+// Normal-buffer selection only needs button-motion reports; unlike 1003h, 1002h
+// does not emit an event for every idle pointer movement.
+const NORMAL_MOUSE_TRACKING_ON = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+const NORMAL_MOUSE_TRACKING_OFF = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
 
 type InputListenerResult = { consume?: boolean; data?: string } | undefined;
 type InputListener = (data: string) => InputListenerResult;
@@ -893,7 +898,7 @@ export class TUI extends Container {
 			!this.#resizeProbe &&
 			!this.#pendingAltExit.length;
 		if (wanted === this.#normalMouseTrackingActive) return;
-		this.terminal.write(wanted ? MOUSE_TRACKING_ON : MOUSE_TRACKING_OFF);
+		this.terminal.write(wanted ? NORMAL_MOUSE_TRACKING_ON : NORMAL_MOUSE_TRACKING_OFF);
 		this.#normalMouseTrackingActive = wanted;
 	}
 
@@ -2659,7 +2664,7 @@ export class TUI extends Container {
 			// modified-key reporting sequence on the freshly entered alternate
 			// screen, or Esc/modified keys revert to legacy encoding inside
 			// fullscreen overlays (Ghostty/kitty/iTerm2).
-			const normalMouseExit = this.#normalMouseTrackingActive ? MOUSE_TRACKING_OFF : "";
+			const normalMouseExit = this.#normalMouseTrackingActive ? NORMAL_MOUSE_TRACKING_OFF : "";
 			const mouseEnter = wantMouseTracking ? MOUSE_TRACKING_ON : "";
 			this.terminal.write(`${normalMouseExit}\x1b[?1049h${this.#keyboardEnhancementEnter()}${mouseEnter}`);
 			setAltScreenActive(true);

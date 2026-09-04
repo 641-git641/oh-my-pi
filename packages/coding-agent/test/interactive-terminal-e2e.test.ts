@@ -60,6 +60,7 @@ describe("libkitty end-to-end", () => {
 		resetSettingsForTest();
 		tempDir = TempDir.createSync("@pi-libkitty-e2e-");
 		await Settings.init({ inMemory: true, cwd: tempDir.path() });
+		Settings.instance.set("tui.mouseSelection", true);
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
 		const modelRegistry = new ModelRegistry(authStorage);
 		const model = modelRegistry.find("anthropic", "claude-sonnet-4-5");
@@ -103,7 +104,7 @@ describe("libkitty end-to-end", () => {
 		expect(hits.length).toBe(1);
 	});
 
-	it("copies a visible transcript drag and shows a bottom-right toast", async () => {
+	it("copies a visible transcript drag when release lands outside the transcript", async () => {
 		const copySpy = vi.spyOn(clipboard, "copyToClipboard").mockResolvedValue(undefined);
 		const target = "drag-copy-target";
 		try {
@@ -122,7 +123,7 @@ describe("libkitty end-to-end", () => {
 
 			term.sendInput(`\x1b[<0;${startColumn + 1};${screenRow + 1}M`);
 			term.sendInput(`\x1b[<32;${endColumn + 1};${screenRow + 1}M`);
-			term.sendInput(`\x1b[<0;${endColumn + 1};${screenRow + 1}m`);
+			term.sendInput(`\x1b[<0;${endColumn + 1};${term.rows + 1}m`);
 			await term.waitForRender();
 
 			expect(copySpy).toHaveBeenCalledWith(target);
