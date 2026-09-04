@@ -11,6 +11,18 @@ describe("sliceViewportSelection", () => {
 		);
 	});
 
+	it("retains OSC 66 payloads in copied and highlighted text", () => {
+		const osc66 = "\x1b]66;s=2;Hi\x1b\\";
+		expect(sliceViewportSelection([osc66], 4, { row: 0, col: 0 }, { row: 0, col: 3 })).toBe("Hi");
+		const [highlighted] = highlightViewportSelection([osc66], 4, { row: 0, col: 0 }, { row: 0, col: 3 });
+		expect(highlighted).toContain("Hi");
+	});
+
+	it("expands endpoints that land inside wide graphemes", () => {
+		expect(sliceViewportSelection(["a界b"], 4, { row: 0, col: 1 }, { row: 0, col: 1 })).toBe("界");
+		expect(sliceViewportSelection(["a界b"], 4, { row: 0, col: 2 }, { row: 0, col: 2 })).toBe("界");
+	});
+
 	it("orders a reverse drag and keeps the selected line break", () => {
 		expect(sliceViewportSelection(["first", "second", "third"], 8, { row: 2, col: 2 }, { row: 0, col: 1 })).toBe(
 			"irst\nsecond\nthi",

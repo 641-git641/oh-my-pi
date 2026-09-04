@@ -34,6 +34,25 @@ import { copyToClipboard } from "../utils/clipboard";
 const DOUBLE_INTERRUPT_MS = 500;
 const EMPTY_VIEWPORT_ROWS: readonly string[] = [];
 
+function reflowRowsAtWidth(lines: readonly string[], width: number): string[] {
+	const columns = Math.max(1, width);
+	const reflowed: string[] = [];
+	for (const line of lines) {
+		const lineWidth = visibleWidth(line);
+		if (lineWidth === 0) {
+			reflowed.push("");
+			continue;
+		}
+		for (let column = 0; column < lineWidth;) {
+			let slice = sliceWithWidth(line, column, columns, true);
+			if (slice.width === 0) slice = sliceWithWidth(line, column, columns);
+			reflowed.push(slice.text);
+			column += Math.max(1, slice.width);
+		}
+	}
+	return reflowed;
+}
+
 /** Live settings that affect the composer before and after session adoption. */
 export interface ComposerPreferences {
 	readonly quiet: boolean;
@@ -216,7 +235,6 @@ export class Composer implements TerminalFrameProvider {
 	#visibleHistoryRows: readonly string[] = [];
 	#visibleHistoryScreenOffset = 0;
 	#visibleHistoryWidth = 0;
-	#visibleHistoryHeight = 0;
 	#visibleHistoryBatchId: number | undefined;
 	#mouseSelectionUnsubscribe: (() => void) | undefined;
 	#selectionAnchor: ViewportSelectionPoint | undefined;
@@ -416,8 +434,16 @@ export class Composer implements TerminalFrameProvider {
 		this.#visibleHistoryRows = EMPTY_VIEWPORT_ROWS;
 		this.#visibleHistoryScreenOffset = 0;
 		this.#visibleHistoryWidth = 0;
-		this.#visibleHistoryHeight = 0;
 		this.#visibleHistoryBatchId = undefined;
+	}
+
+	#refreshVisibleHistory(width: number): void {
+		if (this.#visibleHistoryRows.length === 0) return;
+		if (this.#visibleHistoryWidth !== width) {
+			this.#visibleHistoryRows = reflowRowsAtWidth(this.#visibleHistoryRows, width);
+			this.#visibleHistoryScreenOffset = -this.#visibleHistoryRows.length;
+		}
+		this.#visibleHistoryWidth = width;
 	}
 
 	#clearViewportSelection(): void {
@@ -426,7 +452,7 @@ export class Composer implements TerminalFrameProvider {
 		this.#clearVisibleHistory();
 	}
 
-	#recordVisibleHistory(history: TerminalFramePlan["history"], width: number, height: number): void {
+	#recordVisibleHistory(history: TerminalFramePlan["history"], width: number): void {
 		if (history === undefined) return;
 		const offered = this.#offeredHistory;
 		if (offered === undefined || offered.id !== history.id || offered.source === "header") {
@@ -443,7 +469,6 @@ export class Composer implements TerminalFrameProvider {
 			this.#visibleHistoryScreenOffset -= history.rows.length;
 		}
 		this.#visibleHistoryWidth = width;
-		this.#visibleHistoryHeight = height;
 		this.#visibleHistoryBatchId = history.id;
 	}
 
@@ -451,12 +476,7 @@ export class Composer implements TerminalFrameProvider {
 	renderFrame(viewport: ViewportSize): TerminalFramePlan {
 		const width = Math.max(1, viewport.columns);
 		const rows = Math.max(0, viewport.rows);
-		if (
-			this.#visibleHistoryRows.length > 0 &&
-			(this.#visibleHistoryWidth !== width || this.#visibleHistoryHeight !== rows)
-		) {
-			this.#clearVisibleHistory();
-		}
+		this.#refreshVisibleHistory(width);
 		if (!this.#started || this.#stopped) {
 			this.#clearVisibleHistory();
 			this.#recordVisibleViewport(width, -1, []);
@@ -486,7 +506,7 @@ export class Composer implements TerminalFrameProvider {
 		// leaves the mutable viewport in the same frame it is appended, so its
 		// rows are never painted twice.
 		const history = this.#offerHistory(transcript, width, rows, preRoots.length + after.length);
-		this.#recordVisibleHistory(history, width, rows);
+		this.#recordVisibleHistory(history, width);
 		const headerVisible = !this.#headerRetired && this.#offeredHistory?.source !== "header";
 		const headerRows = headerVisible ? this.#header.render(width) : [];
 		const before = [...headerRows, ...preRoots];
